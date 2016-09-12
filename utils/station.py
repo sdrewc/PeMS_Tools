@@ -1,13 +1,17 @@
-__author__ = 'Andrew Campbell'
-
+import datetime
+import gc
 import os
 import shutil
+import sys
 import time
 
 import numpy as np
 import pandas as pd
 
 import utils.util_exceptions
+
+__author__ = 'Andrew Campbell'
+
 """
 These tools are used for processing Station 5-Minute raw data files. These files are reported at the district  level of
 spatial aggregation, which may be too big or small for the level of analysis. These tools allow you to extract the rows
@@ -24,7 +28,8 @@ def get_station_targets(station_path, meta_path, out_path,
     """
     Extracts station data rows from only the stations that have and ID that appears in the metadata file defined
     by meta_path. The meta_path file should be the aggregate of all stations we want to study. Thus, all station
-    filtering should be done in the creation of this aggregate metadata file.
+    filtering should be done in the creation of this aggregate metadata file. Writes the target stations to
+    csv files in the same format.
     :param station_path: (str) Path to directory with station data.
     :param meta_path: (str) Path to a file with the meta data for all case study stations. This should be the text file
     written by get_meta_targets()
@@ -195,7 +200,8 @@ def generate_time_series_V2(meta_target_path, station_path, out_path, preamble='
     fnames.sort()  # Sort names in ascending chronological order
     start_dir = os.getcwd()
     # Step 1 - Get all unique station IDs from meta_target_path. Aggregated into n_chunks arrays
-    target_ids = np.unique(pd.read_csv(meta_target_path, sep='\t')['ID'])  # IDs of stations in case study area
+    # target_ids = np.unique(pd.read_csv(meta_target_path, sep='\t')['ID'])  # IDs of stations in case study area
+    target_ids = np.unique(pd.read_csv(meta_target_path)['ID'])  # IDs of stations in case study area
     n = target_ids.shape[0] / n_chunks  # Number of IDs per set
     chunks = []
     for i in np.arange(n_chunks):
@@ -209,13 +215,17 @@ def generate_time_series_V2(meta_target_path, station_path, out_path, preamble='
         # Step 3 - Iterate through all the station data files
         os.chdir(station_path)
         tic = time.time()
-        for name in fnames:
+        for name in fnames:  # Iterate through each station data file. Each file is typically a unique date.
             print 'Processing ' + name
             temp = pd.read_csv(name, sep=',', header=None, index_col=False)
             # Step 4 - Iterate through all the IDs in the chunk, extract the time series and append to temp_chunk.
             for stat_id in chunk:
                 temp_list.append(get_id_time_series(temp, stat_id))  # Time series for stat_id
-        temp_chunk = pd.concat(temp_list)
+            del temp  # delete it to clear memory
+            # print "Size of temp_list[] = %d" %sys.getsizeof(temp_list)
+            gc.collect()
+        temp_chunk = pd.concat(temp_list)  # One big time series with all stations in chunk
+        del temp_list
         print 'Time to process %f' % (time.time() - tic)
         # Step 5 - Write the output for IDs in the current chunk
         for stat_id in chunk:
@@ -223,10 +233,57 @@ def generate_time_series_V2(meta_target_path, station_path, out_path, preamble='
             os.chdir(out_path)
             os.mkdir(str(stat_id))
             os.chdir(str(stat_id))
-            temp_ts = temp_chunk[temp_chunk['Station'] == stat_id]
+            temp_ts = temp_chunk[temp_chunk['Station'] == stat_id]  # time series with just the stat_id
             temp_ts.to_csv('time_series.csv', sep=',', index=False)
             ts_agg_measures(temp_ts).to_csv('summary.csv', sep=',', index=False)
+        del temp_chunk  # clear this from memory
     os.chdir(start_dir)
+
+
+def rollup_time_series(agg_period, station_path, out_name, nrows=105120):
+    """
+    Used to rollup the raw time series into larger temporal aggregates. By default, the time series will be in 5-minute
+    time bins. This method can be used to bin them into 15 or 30 minute bins (or any other aggregation).
+    :param agg_period: (int) Defines how many rows to group together during aggregation.
+    :param station_path: (str) Path to the directory containing the station time_series.csv
+    processed. This directory should have been created by utils.station.get_station_targets().
+    :param out_name: (str) Name of output csv to be written in same directory as station_path
+    :param nrows: (int) Number of rows that a time series with no missing observations should. Defaults to 105120,
+    365*24*60/5
+    :return:
+    """
+    start_dir = os.getcwd()
+    os.chdir(station_path)
+    ts = pd.read_csv('time_series.csv', sep=',', index_col='Timestamp')
+    # Check for missing rows and reindex if needed
+    if ts.shape[0] != nrows:
+        ts = reindex_timeseries(ts)
+    # Generate the rolling harmonic mean
+    harm_means = np.empty((ts.shape[0] / agg_period))
+    samp_sums = np.empty((ts.shape[0] / agg_period))
+    flow_sums = np.empty((ts.shape[0] / agg_period))
+    #TODO should we be using ts.resample here?
+    for j, i in enumerate(np.arange(0, ts.shape[0], agg_period)):
+        end = i + agg_period  # end index of period
+        ss = np.sum(ts['Samples'][i:end])  # sum of samples
+        samp_sums[j] = ss
+        sf = np.sum(ts['Total_Flow'][i:end])  # sum of flows
+        flow_sums[j] = sf
+        hm = sf / np.sum(np.divide(ts['Total_Flow'][i:end], ts['Avg_Speed'][i:end]))
+        harm_means[j] = hm
+    # Create output dataframe and write to csv
+    out = ts.iloc[np.arange(0, ts.shape[0], agg_period), :]
+    out.drop('Avg_Occ', axis=1, inplace=True)
+    out.drop('Observed', axis=1, inplace=True)
+    out.drop('Samples', axis=1, inplace=True)
+    out.drop('Total_Flow', axis=1, inplace=True)
+    out.drop('Avg_Speed', axis=1, inplace=True)
+    out['Samples_Rollup'] = samp_sums
+    out['Total_Flow_Rollup'] = flow_sums
+    out['Avg_Speed_Rollup'] = harm_means
+    out.to_csv(out_name, header=True, index=True)
+    os.chdir(start_dir)
+
 
 def generate_distributions(ts_df, metric, bins, days=None):
     """
@@ -236,7 +293,8 @@ def generate_distributions(ts_df, metric, bins, days=None):
     :param ts_df: (str) Path to csv file with the station time series. This csv must be the output of
     station.generate_time_series
     :param metric: (str) Identifies the metric for which to generate a distribution. Either 'Count' or 'Speed'
-    :param bins: (list) List of bin edges, including lower and upper bins. e.g [0,1,2,3] defines three bins.
+    :param bins: (list) List of bin edges, including lower and upper bins. e.g [0,1,2,3] defines three bins. These bins
+    describe the width the metric (e.g. how many mph wide should the speed distribution bins be?)
     :param days: ([int]) Integers identifying the days of the week to create distributions for. Sunday = 0, ...
     Saturday = 6. Defaults to None. If None, all seven days used, days = [0, 1, ... 6]
     :return: ([[df...]]) List of lists of dataframes. Each sublist contains four dataframes: totals (histogram),
@@ -276,7 +334,7 @@ def generate_distributions(ts_df, metric, bins, days=None):
         # Totals dataframe
         ##
         # NOTE for some goddamn reason this groupby(*).apply(*) generates a series with shape (288,) where
-        # ach element is an nd.array. So I then have to coerce it into a dataframe
+        # each element is an nd.array. So I then have to coerce it into a dataframe
         series = ts_temp.groupby('Minutes').apply(lambda s: np.histogram(s[metric_col], bins=bins)[0])
         totals = pd.DataFrame([a for a in series], index=series.index, columns=bins[0:-1])
         ##
@@ -288,7 +346,8 @@ def generate_distributions(ts_df, metric, bins, days=None):
         ##
         row_totals = totals.sum(axis=1)
         z = zip(row_totals, proportions.values)
-        var_tots = pd.DataFrame([np.power(a, 3)/(a-1)*b*(1-b) for a, b in z], index=row_totals.index, columns=proportions.columns)
+        var_tots = pd.DataFrame([np.power(a, 3)/(a-1)*b*(1-b) for a, b in z], index=row_totals.index,
+                                columns=proportions.columns)
         ##
         # Variance of proportions
         ##
@@ -482,7 +541,6 @@ def time_period_analysis(parent_dir, target_dir, time_period, metric, out_dir, w
 
 
 
-
 ######################################################################################################################
 # Helper functions
 ######################################################################################################################
@@ -535,3 +593,17 @@ def get_metric(metric):
         raise utils.util_exceptions.WrongParamError(
             'The metric parameter is invalid. Try using: None, Count, or Speed'
         )
+
+def reindex_timeseries(ts_df, start_time_string='05/01/2014 00:00:00', days=365):
+    """
+    If the time series is missing observations, inserts a row with NaN values. That way every dataframe is the same
+    size.
+    :param ts_df: (pd.DataFrame)
+    :return: (pd.DataFrame)
+    """
+    # Make the index for a full day
+    start_datetime = datetime.datetime.strptime(start_time_string, "%m/%d/%Y %H:%M:%S")
+    delta = datetime.timedelta(minutes=5)
+    time_index = [(start_datetime + i*delta).strftime("%m/%d/%Y %H:%M:%S") for i in np.arange(days*24*60/5)]
+    # Return a new dataframe that has been reindexed to the full set of observations. Missing rows will have NaN vals
+    return ts_df.reindex(time_index, method=None, copy=True)
